@@ -36,16 +36,37 @@ init(Req0, State) ->
 terminate(_Reason, _Req, _State) ->
     ok.
 
-%% Generate embryo list from API request
+%% Generate embryo list from API request with filtering capabilities
 generate_velib_data(JsonBinary) ->
     case jsone:decode(JsonBinary, [{keys, atom}]) of
         Request when is_map(Request) ->
-            % Fix: Handle both binary and string values properly
-            MaxResults = parse_integer_param(maps:get(max_results, Request, <<"10">>)),
+            % Parse request parameters - using same structure as Bing filter
+            SearchValue = maps:get(value, Request, <<"">>),
             Timeout = parse_integer_param(maps:get(timeout, Request, <<"10">>)),
+            
+            % Additional filter parameters (optional)
+            MaxResults = parse_integer_param(maps:get(max_results, Request, <<"50">>)),
+            StatusFilter = maps:get(status_filter, Request, <<"all">>),
+            MinBikes = parse_integer_param(maps:get(min_bikes, Request, <<"0">>)),
+            MaxBikes = parse_integer_param(maps:get(max_bikes, Request, <<"999">>)),
+            MinDocks = parse_integer_param(maps:get(min_docks, Request, <<"0">>)),
 
-            io:format("Fetching Vélib data, max results: ~p~n", [MaxResults]),
-            fetch_velib_stations(MaxResults, Timeout);
+            io:format("Fetching Vélib data with search filter: ~p, timeout: ~p~n", [SearchValue, Timeout]),
+            
+            % Fetch more data than needed to allow proper filtering
+            AllStations = fetch_velib_stations(MaxResults * 3, Timeout),
+            
+            % Apply search filter - primary filter is the search value
+            FilteredStations = apply_search_filters(AllStations, #{
+                search_query => SearchValue,
+                status_filter => StatusFilter,
+                min_bikes => MinBikes,
+                max_bikes => MaxBikes,
+                min_docks => MinDocks
+            }),
+            
+            % Limit final results to requested amount
+            lists:sublist(FilteredStations, MaxResults);
         {error, Reason} ->
             io:format("Error decoding JSON: ~p~n", [Reason]),
             []
@@ -53,11 +74,111 @@ generate_velib_data(JsonBinary) ->
 
 %% Helper function to parse integer parameters that might be binary or string
 parse_integer_param(Value) when is_binary(Value) ->
-    list_to_integer(binary_to_list(Value));
+    try
+        list_to_integer(binary_to_list(Value))
+    catch
+        _:_ -> 0
+    end;
 parse_integer_param(Value) when is_list(Value) ->
-    list_to_integer(Value);
+    try
+        list_to_integer(Value)
+    catch
+        _:_ -> 0
+    end;
 parse_integer_param(Value) when is_integer(Value) ->
-    Value.
+    Value;
+parse_integer_param(_) ->
+    0.
+
+%% Apply search filters to station list
+apply_search_filters(Stations, Filters) ->
+    lists:filter(fun(Station) ->
+        match_all_filters(Station, Filters)
+    end, Stations).
+
+%% Check if a station matches all filter criteria
+match_all_filters(Station, Filters) ->
+    StationData = extract_station_data(Station),
+    
+    % Station must match all criteria to be included
+    % Primary filter is the search query (e.g., "Benjamin")
+    match_search_query(StationData, maps:get(search_query, Filters)) andalso
+    match_status_filter(StationData, maps:get(status_filter, Filters)) andalso
+    match_bike_range(StationData, maps:get(min_bikes, Filters), maps:get(max_bikes, Filters)) andalso
+    match_dock_minimum(StationData, maps:get(min_docks, Filters)).
+
+%% Extract structured data from station embryo for filtering
+extract_station_data(#{properties := #{<<"resume">> := Resume}}) ->
+    % Parse resume string to extract station data
+    ResumeStr = binary_to_list(Resume),
+    
+    % Extract station name (between "Station " and ":")
+    StationName = case string:str(ResumeStr, "Station ") of
+        0 -> "";
+        Pos -> 
+            NameStart = Pos + 8,
+            case string:str(string:substr(ResumeStr, NameStart), ":") of
+                0 -> string:substr(ResumeStr, NameStart);
+                ColonPos -> string:substr(ResumeStr, NameStart, ColonPos - 1)
+            end
+    end,
+    
+    % Extract number of available bikes
+    Bikes = case re:run(ResumeStr, "(\\d+) bikes available", [{capture, all_but_first, list}]) of
+        {match, [BikeStr]} -> list_to_integer(BikeStr);
+        _ -> 0
+    end,
+    
+    % Extract number of free docks
+    Docks = case re:run(ResumeStr, "(\\d+) docks free", [{capture, all_but_first, list}]) of
+        {match, [DockStr]} -> list_to_integer(DockStr);
+        _ -> 0
+    end,
+    
+    % Extract status from parentheses
+    Status = case re:run(ResumeStr, "\\(([^)]+)\\)", [{capture, all_but_first, list}]) of
+        {match, [StatusStr]} -> StatusStr;
+        _ -> 
+            case string:str(ResumeStr, "not in service") of
+                0 -> "unknown";
+                _ -> "maintenance"
+            end
+    end,
+    
+    #{
+        name => StationName,
+        bikes => Bikes,
+        docks => Docks,
+        status => Status,
+        resume => ResumeStr
+    }.
+
+%% Filter by text search in station name (case-insensitive)
+match_search_query(_StationData, <<"">>) -> true;
+match_search_query(#{name := Name}, SearchQuery) ->
+    QueryStr = string:to_lower(binary_to_list(SearchQuery)),
+    NameStr = string:to_lower(Name),
+    % Match if the search term is found anywhere in the station name
+    string:str(NameStr, QueryStr) > 0;
+match_search_query(#{resume := Resume}, SearchQuery) ->
+    % Also search in the full resume text as fallback
+    QueryStr = string:to_lower(binary_to_list(SearchQuery)),
+    ResumeStr = string:to_lower(Resume),
+    string:str(ResumeStr, QueryStr) > 0.
+
+%% Filter by station status
+match_status_filter(_StationData, <<"all">>) -> true;
+match_status_filter(#{status := Status}, StatusFilter) ->
+    FilterStr = binary_to_list(StatusFilter),
+    string:equal(Status, FilterStr).
+
+%% Filter by bike availability range
+match_bike_range(#{bikes := Bikes}, MinBikes, MaxBikes) ->
+    Bikes >= MinBikes andalso Bikes =< MaxBikes.
+
+%% Filter by minimum dock availability
+match_dock_minimum(#{docks := Docks}, MinDocks) ->
+    Docks >= MinDocks.
 
 %% Fetch real Vélib station data from Paris Open Data API
 fetch_velib_stations(MaxResults, TimeoutSecs) ->
@@ -133,14 +254,15 @@ get_station_status(Bikes, Docks) ->
 %% Generate sample embryo data when API is not available
 generate_sample_velib_embryos() ->
     SampleData = [
-        <<"Station République: 8 bikes available, 12 docks free (normal)">>,
-        <<"Station Châtelet: 1 bikes available, 18 docks free (low bikes)">>,
-        <<"Station Bastille: 15 bikes available, 5 docks free (normal)">>,
-        <<"Station Louvre: 0 bikes available, 20 docks free (empty)">>,
+        <<"Station Benjamin Franklin: 8 bikes available, 12 docks free (normal)">>,
+        <<"Station République: 1 bikes available, 18 docks free (low bikes)">>,
+        <<"Station Châtelet: 15 bikes available, 5 docks free (normal)">>,
+        <<"Station Benjamin Constant: 0 bikes available, 20 docks free (empty)">>,
         <<"Station Gare du Nord: 12 bikes available, 8 docks free (normal)">>,
         <<"Station Montmartre: 6 bikes available, 1 docks free (almost full)">>,
-        <<"Station Tour Eiffel: 9 bikes available, 11 docks free (normal)">>,
+        <<"Station Benjamin Rabier: 9 bikes available, 11 docks free (normal)">>,
         <<"Station Opéra: Currently not in service">>,
+        <<"Station Saint-Benjamin: 5 bikes available, 15 docks free (normal)">>,
         list_to_binary(io_lib:format("Data updated: ~s", [format_current_time()]))
     ],
 
