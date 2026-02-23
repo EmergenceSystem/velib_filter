@@ -1,33 +1,65 @@
 %%%-------------------------------------------------------------------
-%%% @doc Paris Vélib real-time availability filter.
+%%% @doc Paris Vélib real-time availability agent.
 %%%
-%%% Fetches station data from the Paris Open Data API and returns
-%%% matching stations as embryo maps. Filters by station name,
-%%% bike count range, dock minimum, and status.
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of station URLs already returned, so
+%%%     duplicate stations across successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(velib_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(VELIB_API_URL,
     "https://opendata.paris.fr/api/records/1.0/search/"
     "?dataset=velib-disponibilite-en-temps-reel").
+
+-define(CAPABILITIES, [
+    <<"velib">>,
+    <<"realtime">>,
+    <<"paris">>,
+    <<"mobility">>,
+    <<"bikes">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(velib_filter, ?MODULE).
+    em_filter:start_agent(velib_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(velib_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
+%%====================================================================
+
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — backward compatibility
 %%====================================================================
 
 handle(Body) when is_binary(Body) ->
@@ -36,7 +68,7 @@ handle(_) ->
     [].
 
 %%====================================================================
-%% Search and processing
+%% Search and processing (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -56,12 +88,12 @@ extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
             Value        = binary_to_list(maps:get(<<"value">>,         Map, <<"">>)),
-            Timeout      = parse_int(maps:get(<<"timeout">>,      Map, 10), 10),
-            MaxResults   = parse_int(maps:get(<<"max_results">>,   Map, 50), 50),
+            Timeout      = parse_int(maps:get(<<"timeout">>,      Map, 10),  10),
+            MaxResults   = parse_int(maps:get(<<"max_results">>,   Map, 50),  50),
             StatusFilter = maps:get(<<"status_filter">>, Map, <<"all">>),
-            MinBikes     = parse_int(maps:get(<<"min_bikes">>,     Map, 0),  0),
-            MaxBikes     = parse_int(maps:get(<<"max_bikes">>,     Map, 999),999),
-            MinDocks     = parse_int(maps:get(<<"min_docks">>,     Map, 0),  0),
+            MinBikes     = parse_int(maps:get(<<"min_bikes">>,     Map, 0),   0),
+            MaxBikes     = parse_int(maps:get(<<"max_bikes">>,     Map, 999), 999),
+            MinDocks     = parse_int(maps:get(<<"min_docks">>,     Map, 0),   0),
             {Value, Timeout, MaxResults, StatusFilter, MinBikes, MaxBikes, MinDocks};
         _ ->
             {binary_to_list(JsonBinary), 10, 50, <<"all">>, 0, 999, 0}
@@ -72,11 +104,8 @@ extract_params(JsonBinary) ->
 parse_int(V, _Default) when is_integer(V) -> V;
 parse_int(V, Default) when is_binary(V) ->
     try binary_to_integer(V) catch _:_ -> Default end;
-parse_int(_, Default) -> Default.
 
-%%--------------------------------------------------------------------
-%% API fetch
-%%--------------------------------------------------------------------
+parse_int(_, Default) -> Default.
 
 fetch_velib_stations(MaxResults, TimeoutSecs) ->
     Url = ?VELIB_API_URL ++ "&rows=" ++ integer_to_list(MaxResults),
@@ -100,12 +129,12 @@ parse_velib_response(JsonBody) ->
 
 create_embryo(Record) ->
     try
-        Fields  = maps:get(<<"fields">>, Record, #{}),
-        Name    = maps:get(<<"name">>,              Fields, <<"Unknown Station">>),
-        Bikes   = maps:get(<<"numbikesavailable">>, Fields, 0),
-        Docks   = maps:get(<<"numdocksavailable">>, Fields, 0),
-        Installed = maps:get(<<"is_installed">>,    Fields, <<"NON">>),
-        Resume  = case Installed of
+        Fields    = maps:get(<<"fields">>, Record, #{}),
+        Name      = maps:get(<<"name">>,              Fields, <<"Unknown Station">>),
+        Bikes     = maps:get(<<"numbikesavailable">>, Fields, 0),
+        Docks     = maps:get(<<"numdocksavailable">>, Fields, 0),
+        Installed = maps:get(<<"is_installed">>,      Fields, <<"NON">>),
+        Resume    = case Installed of
             <<"OUI">> ->
                 Status = station_status(Bikes, Docks),
                 fmt("Station ~s: ~p bikes available, ~p docks free (~s)",
@@ -136,32 +165,25 @@ station_status(Bikes, Docks) ->
        true         -> "normal"
     end.
 
-%%--------------------------------------------------------------------
-%% Filtering
-%%--------------------------------------------------------------------
-
 apply_filters(Stations, Filters) ->
     lists:filter(fun(S) -> match_all(S, Filters) end, Stations).
 
-match_all(#{<<"properties">> := Props} = _S, Filters) ->
-    Name   = binary_to_list(maps:get(<<"name">>,  Props, <<"">>)),
+match_all(#{<<"properties">> := Props}, Filters) ->
+    Name   = binary_to_list(maps:get(<<"name">>,   Props, <<"">>)),
     Bikes  = maps:get(<<"bikes">>, Props, 0),
     Docks  = maps:get(<<"docks">>, Props, 0),
     Resume = binary_to_list(maps:get(<<"resume">>, Props, <<"">>)),
-
     Status = case re:run(Resume, "\\(([^)]+)\\)", [{capture, [1], list}]) of
         {match, [S]} -> S;
         _            -> "unknown"
     end,
-
     Query        = maps:get(search_query,  Filters),
     StatusFilter = maps:get(status_filter, Filters),
     MinBikes     = maps:get(min_bikes,     Filters),
     MaxBikes     = maps:get(max_bikes,     Filters),
     MinDocks     = maps:get(min_docks,     Filters),
-
-    match_query(Name, Resume, Query)      andalso
-    match_status(Status, StatusFilter)    andalso
+    match_query(Name, Resume, Query)   andalso
+    match_status(Status, StatusFilter) andalso
     Bikes >= MinBikes andalso Bikes =< MaxBikes andalso
     Docks >= MinDocks;
 match_all(_, _) -> false.
@@ -177,3 +199,11 @@ match_status(Status, Filter) ->
     string:equal(Status, binary_to_list(Filter)).
 
 fmt(F, A) -> lists:flatten(io_lib:format(F, A)).
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
