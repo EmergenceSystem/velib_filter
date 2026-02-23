@@ -1,13 +1,11 @@
 %%%-------------------------------------------------------------------
 %%% @doc Paris Vélib real-time availability agent.
 %%%
-%%% As an agent this module:
-%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
-%%%   - Maintains a memory of station URLs already returned, so
-%%%     duplicate stations across successive queries are filtered out.
+%%% Announces capabilities to em_disco on startup and maintains a
+%%% memory of station URLs already returned so duplicates across
+%%% successive queries are filtered out.
 %%%
 %%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Returns a raw Erlang list — em_filter_server encodes it.
 %%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -15,7 +13,7 @@
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1, handle/2]).
+-export([handle/2]).
 
 -define(VELIB_API_URL,
     "https://opendata.paris.fr/api/records/1.0/search/"
@@ -40,10 +38,10 @@ start(_StartType, _StartArgs) ->
     }).
 
 stop(_State) ->
-    em_filter:stop_filter(velib_filter).
+    em_filter:stop_agent(velib_filter).
 
 %%====================================================================
-%% Agent handler — with memory (primary path)
+%% Agent handler
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
@@ -59,16 +57,7 @@ handle(_Body, Memory) ->
     {[], Memory}.
 
 %%====================================================================
-%% Plain filter handler — backward compatibility
-%%====================================================================
-
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
-
-%%====================================================================
-%% Search and processing (unchanged)
+%% Search and processing
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -104,7 +93,6 @@ extract_params(JsonBinary) ->
 parse_int(V, _Default) when is_integer(V) -> V;
 parse_int(V, Default) when is_binary(V) ->
     try binary_to_integer(V) catch _:_ -> Default end;
-
 parse_int(_, Default) -> Default.
 
 fetch_velib_stations(MaxResults, TimeoutSecs) ->
@@ -199,10 +187,6 @@ match_status(Status, Filter) ->
     string:equal(Status, binary_to_list(Filter)).
 
 fmt(F, A) -> lists:flatten(io_lib:format(F, A)).
-
-%%====================================================================
-%% Internal helpers
-%%====================================================================
 
 -spec url_of(map()) -> binary().
 url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
