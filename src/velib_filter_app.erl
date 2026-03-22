@@ -1,31 +1,33 @@
 %%%-------------------------------------------------------------------
 %%% @doc Paris Vélib real-time availability agent.
 %%%
-%%% Announces capabilities to em_disco on startup and maintains a
-%%% memory of station URLs already returned so duplicates across
-%%% successive queries are filtered out.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(velib_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(VELIB_API_URL,
     "https://opendata.paris.fr/api/records/1.0/search/"
     "?dataset=velib-disponibilite-en-temps-reel").
 
--define(CAPABILITIES, [
-    <<"velib">>,
-    <<"realtime">>,
-    <<"paris">>,
-    <<"mobility">>,
-    <<"bikes">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"velib">>, <<"realtime">>,
+                                      <<"paris">>, <<"mobility">>, <<"bikes">>].
 
 %%====================================================================
 %% Application behaviour
@@ -33,9 +35,9 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(velib_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(velib_filter).
@@ -45,14 +47,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -187,7 +182,3 @@ match_status(Status, Filter) ->
     string:equal(Status, binary_to_list(Filter)).
 
 fmt(F, A) -> lists:flatten(io_lib:format(F, A)).
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
